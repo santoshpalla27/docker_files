@@ -1,0 +1,22 @@
+FROM node:22-alpine
+
+# Security Note: This image runs as root. For production, use a non-root user.
+
+
+WORKDIR /app
+
+COPY package*.json ./
+
+# We use 'npm install' instead of 'npm ci' here to ensure 
+# we get the exact versions but allowing updates if package.json changes.
+# Crucially: We do NOT prune devDependencies.
+RUN npm install
+
+COPY . .
+
+EXPOSE 3000
+
+CMD ["node", "index.js"]
+
+# Note: This Dockerfile does not separate build and production stages.
+# It installs all dependencies in a single stage, which may lead to larger image sizes.
