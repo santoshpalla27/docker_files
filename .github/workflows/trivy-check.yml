@@ -165,13 +165,12 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-report
-          overwrite: true
+          name: trivy-report-${{ steps.info.outputs.image_name }}
           path: |
             trivy-${{ steps.info.outputs.image_name }}-config.json
             trivy-${{ steps.info.outputs.image_name }}-fs.json
             trivy-${{ steps.info.outputs.image_name }}.sarif
-          retention: 10
+          retention-days: 10
 
   # Summary job
   scan-summary:
