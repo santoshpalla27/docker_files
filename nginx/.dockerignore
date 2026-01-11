@@ -1,0 +1,53 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile*
+docker-compose*
+.docker
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+LICENSE
+CHANGELOG
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.travis.yml
+Jenkinsfile
+.circleci
+
+# Testing
+tests
+test
+*.test
+coverage
+
+# Build artifacts
+*.log
+*.tmp
+temp
+tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets (never include in image)
+*.pem
+*.key
+*.crt
+.env
+.env.*
+secrets

@@ -1,0 +1,189 @@
+name: Trivy Security Check
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**/Dockerfile*'
+      - '.github/workflows/trivy-check.yml'
+  pull_request:
+    paths:
+      - '**/Dockerfile*'
+
+jobs:
+  # Detect which directories have changes
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_dirs: ${{ steps.changes.outputs.dirs }}
+      has_changes: ${{ steps.changes.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed directories with Dockerfiles
+        id: changes
+        run: |
+          # Get changed files between commits
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            changed_files=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }})
+          else
+            # For push events, compare with parent commit
+            changed_files=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+          fi
+          
+          echo "Changed files:"
+          echo "$changed_files"
+          
+          # Find directories containing Dockerfiles that have changes
+          changed_dirs=""
+          
+          # Get all directories with Dockerfiles
+          dockerfile_dirs=$(find . -name 'Dockerfile*' -type f -not -path './.git/*' | xargs -I {} dirname {} | sort -u)
+          
+          for dir in $dockerfile_dirs; do
+            # Remove leading ./
+            clean_dir="${dir#./}"
+            
+            # Check if any file in this directory or its parents changed
+            if echo "$changed_files" | grep -q "^$clean_dir"; then
+              if [ -z "$changed_dirs" ]; then
+                changed_dirs="\"$clean_dir\""
+              else
+                changed_dirs="$changed_dirs,\"$clean_dir\""
+              fi
+            fi
+          done
+          
+          # If workflow file changed, scan all directories
+          if echo "$changed_files" | grep -q "\.github/workflows/trivy-check.yml"; then
+            changed_dirs=""
+            for dir in $dockerfile_dirs; do
+              clean_dir="${dir#./}"
+              if [ -z "$changed_dirs" ]; then
+                changed_dirs="\"$clean_dir\""
+              else
+                changed_dirs="$changed_dirs,\"$clean_dir\""
+              fi
+            done
+          fi
+          
+          if [ -z "$changed_dirs" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "dirs=[]" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "dirs=[$changed_dirs]" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Changed directories with Dockerfiles: [$changed_dirs]"
+
+  # Build and scan only changed images
+  trivy-scan:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJson(needs.detect-changes.outputs.changed_dirs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Find Dockerfile in directory
+        id: dockerfile
+        run: |
+          dir="${{ matrix.directory }}"
+          # Find Dockerfile (prefer 'Dockerfile' over 'Dockerfile.*')
+          if [ -f "$dir/Dockerfile" ]; then
+            dockerfile="$dir/Dockerfile"
+          else
+            dockerfile=$(find "$dir" -maxdepth 1 -name 'Dockerfile*' -type f | head -1)
+          fi
+          
+          image_name=$(echo "$dir" | tr '/' '-')
+          
+          echo "dockerfile=$dockerfile" >> $GITHUB_OUTPUT
+          echo "image_name=$image_name" >> $GITHUB_OUTPUT
+          echo "Building from: $dockerfile as $image_name"
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.directory }}
+          file: ${{ steps.dockerfile.outputs.dockerfile }}
+          push: false
+          load: true
+          tags: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Run Trivy for SARIF output
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-${{ steps.dockerfile.outputs.image_name }}.sarif'
+
+      - name: Run Trivy for JSON report
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
+          format: 'json'
+          output: 'trivy-${{ steps.dockerfile.outputs.image_name }}.json'
+
+      - name: Upload Trivy scan results to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-${{ steps.dockerfile.outputs.image_name }}.sarif'
+          category: 'trivy-${{ steps.dockerfile.outputs.image_name }}'
+
+      - name: Upload Trivy reports as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report-${{ steps.dockerfile.outputs.image_name }}
+          path: |
+            trivy-${{ steps.dockerfile.outputs.image_name }}.sarif
+            trivy-${{ steps.dockerfile.outputs.image_name }}.json
+          retention-days: 30
+
+  # Summary job
+  scan-summary:
+    needs: [detect-changes, trivy-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan Summary
+        run: |
+          echo "## Trivy Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.detect-changes.outputs.has_changes }}" == "false" ]; then
+            echo "✅ No Dockerfile changes detected - scan skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Scanned directories: ${{ needs.detect-changes.outputs.changed_dirs }}" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ needs.trivy-scan.result }}" == "success" ]; then
+              echo "✅ All scans passed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Some scans failed - check results above" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
