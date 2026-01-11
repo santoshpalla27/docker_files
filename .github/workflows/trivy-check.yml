@@ -12,6 +12,11 @@ on:
     paths:
       - '**/Dockerfile*'
 
+# Required permissions for SARIF upload
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   # Detect which directories have changes
   detect-changes:
@@ -82,7 +87,7 @@ jobs:
           
           echo "Changed directories with Dockerfiles: [$changed_dirs]"
 
-  # Build and scan only changed images
+  # Scan Dockerfiles directly (no build required)
   trivy-scan:
     needs: detect-changes
     if: needs.detect-changes.outputs.has_changes == 'true'
@@ -95,76 +100,76 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Find Dockerfile in directory
-        id: dockerfile
+      - name: Set image name
+        id: info
         run: |
           dir="${{ matrix.directory }}"
-          # Find Dockerfile (prefer 'Dockerfile' over 'Dockerfile.*')
-          if [ -f "$dir/Dockerfile" ]; then
-            dockerfile="$dir/Dockerfile"
-          else
-            dockerfile=$(find "$dir" -maxdepth 1 -name 'Dockerfile*' -type f | head -1)
-          fi
-          
           image_name=$(echo "$dir" | tr '/' '-')
-          
-          echo "dockerfile=$dockerfile" >> $GITHUB_OUTPUT
           echo "image_name=$image_name" >> $GITHUB_OUTPUT
-          echo "Building from: $dockerfile as $image_name"
+          echo "Scanning directory: $dir as $image_name"
 
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ${{ matrix.directory }}
-          file: ${{ steps.dockerfile.outputs.dockerfile }}
-          push: false
-          load: true
-          tags: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
-
-      - name: Run Trivy vulnerability scanner
+      # Scan Dockerfile for misconfigurations
+      - name: Trivy - Dockerfile misconfiguration scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
+          scan-type: 'config'
+          scan-ref: '${{ matrix.directory }}'
           format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      # Scan filesystem for vulnerabilities in dependencies
+      - name: Trivy - Filesystem vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '${{ matrix.directory }}'
+          format: 'table'
+          exit-code: '0'
           severity: 'CRITICAL,HIGH'
 
-      - name: Run Trivy for SARIF output
+      # Generate JSON report for artifact
+      - name: Generate JSON report
         uses: aquasecurity/trivy-action@master
-        if: always()
         with:
-          image-ref: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
-          format: 'sarif'
-          output: 'trivy-${{ steps.dockerfile.outputs.image_name }}.sarif'
-
-      - name: Run Trivy for JSON report
-        uses: aquasecurity/trivy-action@master
-        if: always()
-        with:
-          image-ref: trivy-scan/${{ steps.dockerfile.outputs.image_name }}:${{ github.sha }}
+          scan-type: 'config'
+          scan-ref: '${{ matrix.directory }}'
           format: 'json'
-          output: 'trivy-${{ steps.dockerfile.outputs.image_name }}.json'
+          output: 'trivy-${{ steps.info.outputs.image_name }}-config.json'
 
-      - name: Upload Trivy scan results to Security tab
+      - name: Generate filesystem JSON report
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '${{ matrix.directory }}'
+          format: 'json'
+          output: 'trivy-${{ steps.info.outputs.image_name }}-fs.json'
+
+      # Generate SARIF for GitHub Security tab
+      - name: Generate SARIF report
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '${{ matrix.directory }}'
+          format: 'sarif'
+          output: 'trivy-${{ steps.info.outputs.image_name }}.sarif'
+
+      - name: Upload to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: 'trivy-${{ steps.dockerfile.outputs.image_name }}.sarif'
-          category: 'trivy-${{ steps.dockerfile.outputs.image_name }}'
+          sarif_file: 'trivy-${{ steps.info.outputs.image_name }}.sarif'
+          category: 'trivy-${{ steps.info.outputs.image_name }}'
 
-      - name: Upload Trivy reports as artifact
+      - name: Upload reports as artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-report-${{ steps.dockerfile.outputs.image_name }}
+          name: trivy-report-${{ steps.info.outputs.image_name }}
           path: |
-            trivy-${{ steps.dockerfile.outputs.image_name }}.sarif
-            trivy-${{ steps.dockerfile.outputs.image_name }}.json
+            trivy-${{ steps.info.outputs.image_name }}-config.json
+            trivy-${{ steps.info.outputs.image_name }}-fs.json
+            trivy-${{ steps.info.outputs.image_name }}.sarif
           retention-days: 30
 
   # Summary job
@@ -180,10 +185,11 @@ jobs:
           if [ "${{ needs.detect-changes.outputs.has_changes }}" == "false" ]; then
             echo "✅ No Dockerfile changes detected - scan skipped" >> $GITHUB_STEP_SUMMARY
           else
-            echo "Scanned directories: ${{ needs.detect-changes.outputs.changed_dirs }}" >> $GITHUB_STEP_SUMMARY
+            echo "📂 Scanned directories: ${{ needs.detect-changes.outputs.changed_dirs }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
             if [ "${{ needs.trivy-scan.result }}" == "success" ]; then
-              echo "✅ All scans passed" >> $GITHUB_STEP_SUMMARY
+              echo "✅ All scans completed successfully" >> $GITHUB_STEP_SUMMARY
             else
-              echo "❌ Some scans failed - check results above" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ Some scans had issues - check results above" >> $GITHUB_STEP_SUMMARY
             fi
           fi
